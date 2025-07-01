@@ -1,254 +1,161 @@
-import json
-import paho.mqtt.client as mqtt
-import threading
-import time
-import requests
-import datetime
-import math
+#!/usr/bin/env python3
+"""
+obu.py
+
+On-Board Unit (OBU) pour Smart City Waste Management.
+Gère dynamiquement N camions, lit les DENM depuis MQTT, calcule les routes
+et publie les CAM.
+
+Étapes :
+ 1. Charger les credentials MinIO via variables d'env
+ 2. Lire `sensor_position.json` depuis GOLD pour positions capteurs
+ 3. Définir `TRUCK_COUNT` en fonction du nombre de positions dispo
+ 4. Initialiser N camions
+ 5. Souscrire au topic DENM (`vanetza/in/denm`)
+ 6. Boucle principale : mise à jour des files, dessin de route, publication CAM
+
+Usage :
+    export MINIO_ENDPOINT=http://localhost:9000
+    export MINIO_ACCESS_KEY=minioadmin
+    export MINIO_SECRET_KEY=minioadmin123
+    export MAPBOX_TOKEN=<votre_token>  # optionnel
+    pip install boto3 paho-mqtt requests
+    python obu.py
+"""
 import os
+import json
+import time
+import math
+import boto3
+from botocore.client import Config
+from datetime import datetime
+import requests
+import paho.mqtt.client as mqtt
 
-# Mapbox Directions API access token
-ACCESS_TOKEN = "pk.eyJ1IjoiYWdvcmFhdmVpcm8iLCJhIjoiY2trbmNoeXd5MXN2cTJudGRodzhjbjR6bSJ9.dvGHDz58mhv1i46hWJvEtQ"
+# ----------------------------------------------------------------------
+# Configuration MinIO & buckets
+# ----------------------------------------------------------------------
+MINIO_ENDPOINT   = os.getenv('MINIO_ENDPOINT', 'http://localhost:9000')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin123')
+GOLD_BUCKET      = 'gold'
+MAPBOX_TOKEN     = os.getenv('MAPBOX_TOKEN', '')  # optionnel
 
-# Home position of the truck #1 (Île de la Cité, Paris)
-HOME_TRUCK1 = [48.8566, 2.3522]
+# Init S3 client
+s3 = boto3.client(
+    's3',
+    endpoint_url=MINIO_ENDPOINT,
+    aws_access_key_id=MINIO_ACCESS_KEY,
+    aws_secret_access_key=MINIO_SECRET_KEY,
+    config=Config(signature_version='s3v4')
+)
 
-# Home position of the truck #2 (Tour Eiffel, Paris)
-HOME_TRUCK2 = [48.8584, 2.2945]
+# ----------------------------------------------------------------------
+# Charger positions capteurs depuis Gold
+# ----------------------------------------------------------------------
+obj = s3.get_object(Bucket=GOLD_BUCKET, Key='sensor/sensor_position.json')
+sensor_positions = json.loads(obj['Body'].read())['positions']
 
-# Home position of the truck #3 (Notre-Dame, Paris)
-HOME_TRUCK3 = [48.8530, 2.3499]
+# Définir nombre de camions selon dispo
+TRUCK_COUNT = min(20, len(sensor_positions))
 
-# Array containing the queue of garbage containers to be emptied by each truck
-queue_truck1 = []
-queue_truck2 = []
-queue_truck3 = []
+# Position "home" de chaque camion
+HOME_TRUCKS = sensor_positions[:TRUCK_COUNT]
 
-# Array containing the current route that each truck is following
-current_route_truck1 = []
-current_route_truck2 = []
-current_route_truck3 = []
+# ----------------------------------------------------------------------
+# Structures dynamiques pour N camions
+# ----------------------------------------------------------------------
+truck_positions = [home.copy() for home in HOME_TRUCKS]
+queue_trucks    = [[] for _ in range(TRUCK_COUNT)]
+current_routes  = [[] for _ in range(TRUCK_COUNT)]
+need_recalc     = [False] * TRUCK_COUNT
 
-# Flag to indicate if the truck needs to recalculate the route
-need_route_recalculation_truck1 = False
-need_route_recalculation_truck2 = False
-need_route_recalculation_truck3 = False
+# ----------------------------------------------------------------------
+# MQTT client pour publication CAM
+# ----------------------------------------------------------------------
+cam_client = mqtt.Client()
+cam_client.connect('127.0.0.1', 18830, 60)
+cam_client.loop_start()
 
-# Current position of each truck given by the CAM messages
-truck_positions = [
-    HOME_TRUCK1,
-    HOME_TRUCK2,
-    HOME_TRUCK3,
-]
+# ----------------------------------------------------------------------
+# Fonction de routage (Mapbox ou fallback)
+# ----------------------------------------------------------------------
+def draw_route(points):
+    """
+    Route planning via Mapbox if token present, else direct points.
+    """
+    if not MAPBOX_TOKEN:
+        return points.copy()
+    coords = ";".join(f"{p[1]},{p[0]}" for p in points)
+    url = f"https://api.mapbox.com/directions/v5/mapbox/driving/{coords}"
+    resp = requests.get(url, params={'access_token': MAPBOX_TOKEN, 'geometries':'geojson'})
+    resp.raise_for_status()
+    data = resp.json()
+    # reverse [lon,lat] to [lat,lon]
+    return [[lat, lon] for lon, lat in data['routes'][0]['geometry']['coordinates']]
 
-# Delete old truck routes from the map
-if os.path.exists("../dashboard/static/route_obu1.json"):
-    os.remove("../dashboard/static/route_obu1.json")
-if os.path.exists("../dashboard/static/route_obu2.json"):
-    os.remove("../dashboard/static/route_obu2.json")
-if os.path.exists("../dashboard/static/route_obu3.json"):
-    os.remove("../dashboard/static/route_obu3.json")
-
-
-# Sort the garbage containers by distance to the truck
-def sort_by_distance(queue, truck_position):
-    return sorted(queue, key=lambda x: math.dist(x, truck_position))
-
-
-# Draw the route between the truck and the next garbage container(s)
-def draw_route(points, route_id, output_to_file=True):
-    # Add the truck current position to the beginning of the points array
-    points.insert(0, truck_positions[int(route_id) - 1])
-
-    point_strings = [
-        f"{point[1]},{point[0]}" for point in points if point is not None
-    ]
-    points_url = ";".join(point_strings)
-
-    request_url = (
-        f"https://api.mapbox.com/directions/v5/mapbox/driving/{points_url}"
-        f"?geometries=geojson&overview=full&access_token={ACCESS_TOKEN}"
-    )
-    response = requests.get(request_url)
-    data = json.loads(response.text)
-
-    if response.status_code != 200 or not data["routes"]:
-        print("\n\n\nERROR:", data.get("message", "Unknown error"))
-        exit()
-
-    route_geometry = data["routes"][0]["geometry"]["coordinates"]
-    route_geometry = [[lon, lat] for lat, lon in route_geometry]
-
-    if output_to_file:
-        route_distance = round(data["routes"][0]["distance"] / 1000, 2)
-        route_duration = str(
-            datetime.timedelta(seconds=round(data["routes"][0]["duration"]))
-        )
-
-        with open(f"../dashboard/static/route_obu{route_id}.json", "w") as file:
-            json.dump(
-                {"geometry": route_geometry, "duration": route_duration, "distance": route_distance},
-                file
-            )
-
-    return route_geometry
-
-
+# ----------------------------------------------------------------------
+# MQTT client pour souscription DENM
+# ----------------------------------------------------------------------
 def on_connect(client, userdata, flags, rc):
-    print("Connected with result code "+str(rc))
-    client.subscribe("vanetza/out/denm")
+    print(f"OBU MQTT connected (rc={rc}), subscribing to DENM topic")
+    client.subscribe('vanetza/in/denm')
 
 
 def on_message(client, userdata, msg):
-    message = json.loads(msg.payload.decode('utf-8'))
+    m = json.loads(msg.payload.decode())
+    sub = m.get('management', {}).get('eventType', {}).get('subCauseCode')
+    if not isinstance(sub, int) or not (1 <= sub <= TRUCK_COUNT):
+        return
+    idx = sub - 1
+    pos = m.get('situation', {}).get('eventPosition', {})
+    lat = pos.get('latitude')
+    lon = pos.get('longitude')
+    if lat is None or lon is None:
+        return
+    queue_trucks[idx].append([lat, lon])
+    need_recalc[idx] = True
+    print(f"DENM received → Truck #{sub} assigned to ({lat:.6f},{lon:.6f})")
 
-    assigned_truck = message["fields"]["denm"]["situation"]["eventType"]["subCauseCode"]
-    truck_id = message["receiverID"]
+sub_client = mqtt.Client()
+sub_client.on_connect  = on_connect
+sub_client.on_message  = on_message
+sub_client.connect('127.0.0.1', 18830, 60)
+sub_client.loop_start()
 
-    if assigned_truck == truck_id:
-        latitude = message["fields"]["denm"]["management"]["eventPosition"]["latitude"]
-        longitude = message["fields"]["denm"]["management"]["eventPosition"]["longitude"]
-
-        global queue_truck1, queue_truck2, queue_truck3
-        global need_route_recalculation_truck1, need_route_recalculation_truck2, need_route_recalculation_truck3
-
-        if truck_id == 1:
-            queue_truck1.append([latitude, longitude])
-        elif truck_id == 2:
-            queue_truck2.append([latitude, longitude])
-        elif truck_id == 3:
-            queue_truck3.append([latitude, longitude])
-
-        if truck_id == 1:
-            if queue_truck1 != sort_by_distance(queue_truck1, truck_positions[0]):
-                queue_truck1 = sort_by_distance(queue_truck1, truck_positions[0])
-                need_route_recalculation_truck1 = True
-
-        elif truck_id == 2:
-            if queue_truck2 != sort_by_distance(queue_truck2, truck_positions[1]):
-                queue_truck2 = sort_by_distance(queue_truck2, truck_positions[1])
-                need_route_recalculation_truck2 = True
-
-        elif truck_id == 3:
-            if queue_truck3 != sort_by_distance(queue_truck3, truck_positions[2]):
-                queue_truck3 = sort_by_distance(queue_truck3, truck_positions[2])
-                need_route_recalculation_truck3 = True
-
-
-def generate(client, station_id, latitude, longitude):
-    with open("in_cam.json") as f:
-        m = json.load(f)
-    m["stationID"] = station_id
-    m["latitude"] = latitude
-    m["longitude"] = longitude
-    client.publish("vanetza/in/cam", json.dumps(m))
-    truck_positions[station_id - 1] = [latitude, longitude]
-    f.close()
-
-
-client1 = mqtt.Client()
-client1.on_connect = on_connect
-client1.on_message = on_message
-client1.connect("127.0.0.1", 18831, 60)
-
-client2 = mqtt.Client()
-client2.on_connect = on_connect
-client2.on_message = on_message
-client2.connect("127.0.0.1", 18832, 60)
-
-client3 = mqtt.Client()
-client3.on_connect = on_connect
-client3.on_message = on_message
-client3.connect("127.0.0.1", 18833, 60)
-
-threading.Thread(target=client1.loop_forever).start()
-threading.Thread(target=client2.loop_forever).start()
-threading.Thread(target=client3.loop_forever).start()
-
-time.sleep(0.5)
-
+# ----------------------------------------------------------------------
+# Boucle principale d'émission CAM
+# ----------------------------------------------------------------------
+print(f"Starting OBU loop with {TRUCK_COUNT} trucks...")
 while True:
-    ##### TRUCK #1 #####
-    if not queue_truck1 and not current_route_truck1:
-        if math.dist(HOME_TRUCK1, truck_positions[0]) < 0.0001:
-            waypoint = HOME_TRUCK1
-            print("\033[96mTruck #1 is at home waiting for a mission...\033[0m")
+    for idx in range(TRUCK_COUNT):
+        home   = HOME_TRUCKS[idx]
+        queue  = queue_trucks[idx]
+        route  = current_routes[idx]
+
+        # recalcul route si demandé ou route vide
+        if need_recalc[idx] or not route:
+            if queue:
+                route = draw_route(queue)
+                current_routes[idx] = route
+            need_recalc[idx] = False
+
+        # choisir waypoint courant
+        if route:
+            waypoint = route.pop(0)
+            if not route:
+                queue_trucks[idx] = []
         else:
-            queue_truck1 = [HOME_TRUCK1]
-            current_route_truck1 = draw_route([HOME_TRUCK1], "1", False)
-            waypoint = current_route_truck1.pop(0)
-            print("\033[92mTruck #1 is going home!\033[0m")
-    else:
-        print("\033[1m\033[34mTruck #1 is on the road!!!\033[0m")
-        if not current_route_truck1 or need_route_recalculation_truck1:
-            need_route_recalculation_truck1 = False
-            current_route_truck1 = draw_route(queue_truck1, "1")
+            waypoint = home
 
-        print(f"\033[90mWaypoints remaining for truck #1 route: {len(current_route_truck1)}\033[0m")
-        waypoint = current_route_truck1.pop(0)
+        # construire CAM
+        cam = {
+            'stationID': idx+1,
+            'latitude' : waypoint[0],
+            'longitude': waypoint[1],
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
+        cam_client.publish('vanetza/in/cam', json.dumps(cam))
+        time.sleep(0.2)
 
-        if not current_route_truck1:
-            print("\n\033[01m\033[33m\033[04mTruck #1 finished route\033[0m\n")
-            queue_truck1 = []
-            if os.path.exists("../dashboard/static/route_obu1.json"):
-                os.remove("../dashboard/static/route_obu1.json")
-
-    generate(client1, 1, waypoint[0], waypoint[1])
-    time.sleep(0.3)
-
-    ##### TRUCK #2 #####
-    if not queue_truck2 and not current_route_truck2:
-        if math.dist(HOME_TRUCK2, truck_positions[1]) < 0.0001:
-            waypoint = HOME_TRUCK2
-            print("\033[96mTruck #2 is at home waiting for a mission...\033[0m")
-        else:
-            queue_truck2 = [HOME_TRUCK2]
-            current_route_truck2 = draw_route([HOME_TRUCK2], "2", False)
-            waypoint = current_route_truck2.pop(0)
-            print("\033[92mTruck #2 is going home!\033[0m")
-    else:
-        print("\033[1m\033[34mTruck #2 is on the road!!!\033[0m")
-        if not current_route_truck2 or need_route_recalculation_truck2:
-            need_route_recalculation_truck2 = False
-            current_route_truck2 = draw_route(queue_truck2, "2")
-
-        print(f"\033[90mWaypoints remaining for truck #2 route: {len(current_route_truck2)}\033[0m")
-        waypoint = current_route_truck2.pop(0)
-
-        if not current_route_truck2:
-            print("\n\033[01m\033[33m\033[04mTruck #2 finished route\033[0m\n")
-            queue_truck2 = []
-            if os.path.exists("../dashboard/static/route_obu2.json"):
-                os.remove("../dashboard/static/route_obu2.json")
-
-    generate(client2, 2, waypoint[0], waypoint[1])
-    time.sleep(0.3)
-
-    ##### TRUCK #3 #####
-    if not queue_truck3 and not current_route_truck3:
-        if math.dist(HOME_TRUCK3, truck_positions[2]) < 0.0001:
-            waypoint = HOME_TRUCK3
-            print("\033[96mTruck #3 is at home waiting for a mission...\033[0m")
-        else:
-            queue_truck3 = [HOME_TRUCK3]
-            current_route_truck3 = draw_route([HOME_TRUCK3], "3", False)
-            waypoint = current_route_truck3.pop(0)
-            print("\033[92mTruck #3 is going home!\033[0m")
-    else:
-        print("\033[1m\033[34mTruck #3 is on the road!!!\033[0m")
-        if not current_route_truck3 or need_route_recalculation_truck3:
-            need_route_recalculation_truck3 = False
-            current_route_truck3 = draw_route(queue_truck3, "3")
-
-        print(f"\033[90mWaypoints remaining for truck #3 route: {len(current_route_truck3)}\033[0m")
-        waypoint = current_route_truck3.pop(0)
-
-        if not current_route_truck3:
-            print("\n\033[01m\033[33m\033[04mTruck #3 finished route\033[0m\n")
-            queue_truck3 = []
-            if os.path.exists("../dashboard/static/route_obu3.json"):
-                os.remove("../dashboard/static/route_obu3.json")
-
-    generate(client3, 3, waypoint[0], waypoint[1])
-    time.sleep(0.3)
-    print()
+    time.sleep(1)
